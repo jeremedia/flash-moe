@@ -124,7 +124,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT "/Users/jeremy/Documents/flash-moe/model"
 
 // ============================================================================
 // Timing helper
@@ -615,6 +615,88 @@ static const char *decode_token(Vocabulary *v, int token_id) {
         return "<unk>";
     }
     return v->tokens[token_id];
+}
+
+// ============================================================================
+// BPE byte-level decoder (GPT-2 convention → raw UTF-8)
+// ============================================================================
+// GPT-2's byte-level BPE encodes each raw byte as a Unicode character.
+// Printable ASCII (0x21-0x7E) and Latin-1 Supplement (0xA1-0xAC, 0xAE-0xFF)
+// map to themselves. All other bytes (space, newline, tab, control chars, 0x7F-0xA0, 0xAD)
+// map to U+0100..U+0143 in order.
+//
+// This function reverses that mapping: given a BPE token string with characters
+// like Ġ (U+0120 = space) and Ċ (U+010A = newline), it produces the raw bytes.
+
+static int bpe_byte_table_built = 0;
+static uint8_t bpe_unicode_to_byte[512]; // Unicode codepoint (0..511) -> raw byte
+
+static void bpe_build_byte_table(void) {
+    if (bpe_byte_table_built) return;
+    memset(bpe_unicode_to_byte, 0, sizeof(bpe_unicode_to_byte));
+
+    // Build the GPT-2 byte_encoder mapping, then invert it
+    int n = 0;
+    uint16_t byte_to_unicode[256];
+    for (int b = 0; b < 256; b++) {
+        if ((b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF)) {
+            byte_to_unicode[b] = (uint16_t)b;
+        } else {
+            byte_to_unicode[b] = (uint16_t)(256 + n);
+            n++;
+        }
+    }
+    // Invert: unicode -> byte
+    for (int b = 0; b < 256; b++) {
+        uint16_t u = byte_to_unicode[b];
+        if (u < 512) bpe_unicode_to_byte[u] = (uint8_t)b;
+    }
+    bpe_byte_table_built = 1;
+}
+
+// Decode a BPE token string to raw UTF-8 bytes.
+// Returns a pointer to a static thread-local buffer (valid until next call).
+static const char *bpe_decode_to_utf8(const char *bpe_str) {
+    static __thread char buf[4096];
+    bpe_build_byte_table();
+
+    int out = 0;
+    const uint8_t *p = (const uint8_t *)bpe_str;
+    while (*p && out < (int)sizeof(buf) - 4) {
+        uint32_t codepoint;
+        int consumed;
+
+        // Decode UTF-8 codepoint
+        if (*p < 0x80) {
+            codepoint = *p;
+            consumed = 1;
+        } else if ((*p & 0xE0) == 0xC0) {
+            codepoint = (*p & 0x1F) << 6 | (*(p+1) & 0x3F);
+            consumed = 2;
+        } else if ((*p & 0xF0) == 0xE0) {
+            codepoint = (*p & 0x0F) << 12 | (*(p+1) & 0x3F) << 6 | (*(p+2) & 0x3F);
+            consumed = 3;
+        } else if ((*p & 0xF8) == 0xF0) {
+            codepoint = (*p & 0x07) << 18 | (*(p+1) & 0x3F) << 12 | (*(p+2) & 0x3F) << 6 | (*(p+3) & 0x3F);
+            consumed = 4;
+        } else {
+            // Invalid UTF-8, pass through
+            buf[out++] = (char)*p;
+            p++;
+            continue;
+        }
+
+        if (codepoint < 512 && (bpe_unicode_to_byte[codepoint] != 0 || codepoint == 0x100)) {
+            // This is a BPE-encoded byte — decode to the raw byte
+            buf[out++] = (char)bpe_unicode_to_byte[codepoint];
+        } else {
+            // Regular Unicode character — pass through as UTF-8
+            for (int i = 0; i < consumed; i++) buf[out++] = (char)p[i];
+        }
+        p += consumed;
+    }
+    buf[out] = '\0';
+    return buf;
 }
 
 // ============================================================================
@@ -6414,14 +6496,15 @@ static void serve_loop(
                 }
 
                 const char *tok_str = decode_token(vocab, next_token);
+                const char *decoded_str = bpe_decode_to_utf8(tok_str);
                 // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
-                    int tlen = (int)strlen(tok_str);
-                    memcpy(gen_response + gen_resp_len, tok_str, tlen);
+                if (!in_think && decoded_str && gen_resp_len + (int)strlen(decoded_str) < 256*1024 - 1) {
+                    int tlen = (int)strlen(decoded_str);
+                    memcpy(gen_response + gen_resp_len, decoded_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                if (sse_send_delta(client_fd, request_id, decoded_str) < 0) {
                     fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
                     break;
                 }
