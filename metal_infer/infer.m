@@ -116,7 +116,7 @@
 
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
-#define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
+#define GPU_KV_SEQ  131072   // GPU KV buffer pre-allocation — 128K tokens (~8GB for 15 layers, fits in 128GB unified)
 
 // Special tokens
 #define EOS_TOKEN_1         248046
@@ -5880,21 +5880,78 @@ static void http_write_str(int fd, const char *s) {
     http_write(fd, s, (int)strlen(s));
 }
 
+// UTF-8 buffering for BPE-decoded tokens.
+// BPE tokens can split multi-byte UTF-8 chars across boundaries.
+// We hold trailing incomplete bytes until the next token completes them.
+static __thread char utf8_carry[4];
+static __thread int  utf8_carry_len = 0;
+
+static void sse_reset_utf8_carry(void) {
+    utf8_carry_len = 0;
+}
+
+// How many bytes does this UTF-8 lead byte expect total? 0 = continuation/invalid.
+static int utf8_char_len(uint8_t byte) {
+    if (byte < 0x80) return 1;
+    if ((byte & 0xE0) == 0xC0) return 2;
+    if ((byte & 0xF0) == 0xE0) return 3;
+    if ((byte & 0xF8) == 0xF0) return 4;
+    return 0; // continuation or invalid
+}
+
 // Send an SSE chunk with a token delta
 // Returns 0 on success, -1 if client disconnected
 static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
     char chunk[4096];
-    // Escape the token text for JSON
+
+    // Prepend any carried bytes from the previous token
+    char combined[2200];
+    int clen = 0;
+    if (utf8_carry_len > 0) {
+        memcpy(combined, utf8_carry, utf8_carry_len);
+        clen = utf8_carry_len;
+        utf8_carry_len = 0;
+    }
+    int tlen = (int)strlen(token_text);
+    if (clen + tlen > (int)sizeof(combined) - 1) tlen = (int)sizeof(combined) - 1 - clen;
+    memcpy(combined + clen, token_text, tlen);
+    clen += tlen;
+    combined[clen] = '\0';
+
+    // Check if the combined buffer ends with an incomplete UTF-8 sequence.
+    // Walk backwards to find the last lead byte and see if we have enough bytes.
+    int safe_len = clen;
+    for (int i = clen - 1; i >= 0 && i >= clen - 4; i--) {
+        uint8_t b = (uint8_t)combined[i];
+        int expected = utf8_char_len(b);
+        if (expected > 0) {
+            int available = clen - i;
+            if (available < expected) {
+                // Incomplete — carry these bytes to next call
+                safe_len = i;
+                utf8_carry_len = clen - i;
+                memcpy(utf8_carry, combined + i, utf8_carry_len);
+            }
+            break;
+        }
+        // else continuation byte, keep walking back
+    }
+
+    // Nothing safe to send yet (all bytes are a partial sequence)
+    if (safe_len == 0) return 0;
+
+    // Escape the safe portion for JSON
     char escaped[2048];
     char *w = escaped;
-    for (const char *r = token_text; *r && w < escaped + sizeof(escaped) - 8; r++) {
-        switch (*r) {
+    for (int i = 0; i < safe_len && w < escaped + sizeof(escaped) - 8; i++) {
+        char r = combined[i];
+        switch (r) {
             case '"':  *w++ = '\\'; *w++ = '"';  break;
             case '\\': *w++ = '\\'; *w++ = '\\'; break;
             case '\n': *w++ = '\\'; *w++ = 'n';  break;
             case '\r': *w++ = '\\'; *w++ = 'r';  break;
             case '\t': *w++ = '\\'; *w++ = 't';  break;
-            default:   *w++ = *r; break;
+            default:   *w++ = r; break;
         }
     }
     *w = '\0';
@@ -6294,6 +6351,7 @@ static void serve_loop(
 
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
+            sse_reset_utf8_carry();
 
             fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
                     request_id, strlen(content), max_gen,
